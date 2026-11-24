@@ -864,7 +864,7 @@ void attend_flash(const Attend& a, cudaStream_t st) {
         if (error == cudaSuccess) error = cudaGetDeviceProperties(&prop, device);
         if (error != cudaSuccess)
             throw std::runtime_error(std::string("Inkling lane probabilities: ") + cudaGetErrorString(error));
-        if (!kernels::gfx_arch_is(prop.gcnArchName, "gfx1031")) return false;
+        if (!kernels::gfx_arch_is(prop.gcnArchName, "gfx1031") && !kernels::gfx_arch_is(prop.gcnArchName, "gfx1032")) return false;
         std::fputs("strata-poly: STRATA_INKLING_LANE_PROB=1: lane-owned FP32 flash probabilities on gfx1031\n", stderr);
         return true;
     }();

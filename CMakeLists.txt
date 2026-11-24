@@ -2051,7 +2051,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   set(_strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-mxfp4.cu)
   if(STRATA_ENABLE_HIP)
     list(APPEND _strata_poly_mmq_instances ${_strata_poly_mxfp4})
-    if("gfx1031" IN_LIST STRATA_HIP_ARCH_LIST)
+    if("gfx1031" IN_LIST STRATA_HIP_ARCH_LIST OR "gfx1032" IN_LIST STRATA_HIP_ARCH_LIST)
       list(APPEND _strata_poly_mmq_instances src/poly/mmq_nvfp4.cu src/poly/mmq_nvfp4_tail.cu src/poly/mmq_nvfp4_lean.cu
                                             src/poly/mmq_nvfp4_tail_lean.cu src/poly/mmq_nvfp4_scale_bits.cu
                                             src/poly/mmq_nvfp4_tail_scale_bits.cu)

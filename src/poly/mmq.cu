@@ -59,7 +59,7 @@ float* fp4_scales(void* xq, int64_t rows, int64_t cols) {
 bool hip_nvfp4_fits(int64_t w_rows, int64_t w_cols, const ggml_cuda_device_info::cuda_device_info& dev) {
     // gfx1031 in ggml_cuda_info() is RDNA2's base gfx1030 plus one. Limit this experiment to Inkling's
     // fused gate/up and down shapes; RDNA2 uses wave32 DP4A tiles, with no stream-k.
-    if (dev.cc != GGML_CUDA_CC_RDNA2 + 1 || dev.warp_size != 32 || w_rows != 2304 ||
+    if ((dev.cc != GGML_CUDA_CC_RDNA2 + 1 && dev.cc != GGML_CUDA_CC_RDNA2 + 2) || dev.warp_size != 32 || w_rows != 2304 ||
         (w_cols != 2304 && w_cols != 1152)) return false;
     static const bool asked = [] {
         const char* v = std::getenv("STRATA_HIP_NVFP4_MMQ");

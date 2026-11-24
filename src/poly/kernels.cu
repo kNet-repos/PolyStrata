@@ -282,7 +282,7 @@ bool use(int n_in, int n_out, int rows) {
         if (error == cudaSuccess) error = cudaGetDeviceProperties(&prop, device);
         if (error != cudaSuccess)
             throw std::runtime_error(std::string("small GEMM 2x2 device: ") + cudaGetErrorString(error));
-        if (!kernels::gfx_arch_is(prop.gcnArchName, "gfx1031")) return false;
+        if (!kernels::gfx_arch_is(prop.gcnArchName, "gfx1031") && !kernels::gfx_arch_is(prop.gcnArchName, "gfx1032")) return false;
         std::fputs("strata-poly: STRATA_HIP_SMALL_GEMM_2X2=1: K64-prefetch 2x2 F32 GEMM on gfx1031 (rows>=512, qualified shapes)\n", stderr);
         return true;
     }();

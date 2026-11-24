@@ -1372,7 +1372,7 @@ size_t Engine::trim_card_kv(int64_t end) {
         if (asked && asked[0] == '1' && asked[1] == '\0') {
             cudaDeviceProp prop = {};
             if (cudaGetDeviceProperties(&prop, device_) == cudaSuccess &&
-                std::strncmp(prop.gcnArchName, "gfx1031", 7) == 0 &&
+                (std::strncmp(prop.gcnArchName, "gfx1031", 7) == 0 || std::strncmp(prop.gcnArchName, "gfx1032", 7) == 0) &&
                 (prop.gcnArchName[7] == '\0' || prop.gcnArchName[7] == ':'))
                 batch = cudaMemGetInfo(&free_before, &total_b) == cudaSuccess;
         }

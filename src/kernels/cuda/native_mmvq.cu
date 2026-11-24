@@ -3049,7 +3049,7 @@ static bool rdna2_iq4_rows_on() {
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
             throw std::runtime_error("native IQ4_XS: cannot query device properties");
-        enabled = gfx_arch_is(prop.gcnArchName, "gfx1031");
+        enabled = gfx_arch_is(prop.gcnArchName, "gfx1031") || gfx_arch_is(prop.gcnArchName, "gfx1032");
         last_device = dev;
     }
     return enabled;
