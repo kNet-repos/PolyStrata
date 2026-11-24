@@ -277,6 +277,64 @@ inline void row_dot_multi(const uint8_t* row, const uint8_t* const* q_ptrs, cons
     for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(acc[t]);
 }
 
+// 2-row fused multi-token dot (e.g. gate[r] + up[r] or down[r] + down[r+1]):
+// Loads each token's (q, dy) ONCE across both rows and overlaps memory latency on two weight streams.
+template <int NT>
+inline void row2_dot_multi(const uint8_t* row0, const uint8_t* row1,
+                           const uint8_t* const* q_ptrs, const float* const* dy_ptrs,
+                           int nb, float res0[NT], float res1[NT]) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    const __m512i mag = _mm512_broadcast_i32x4(_mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, 1, 2, 3, 4, 6, 8, 12));
+    const __m512i eight = _mm512_set1_epi8(8);
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i ones = _mm512_set1_epi16(1);
+    const __m512i dup4_idx = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+
+    __m512 a0[NT], a1[NT];
+    for (int t = 0; t < NT; ++t) {
+        a0[t] = _mm512_setzero_ps();
+        a1[t] = _mm512_setzero_ps();
+    }
+    const block_nvfp4* x0 = (const block_nvfp4*) row0;
+    const block_nvfp4* x1 = (const block_nvfp4*) row1;
+    const int pf = prefetch_distance();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        if (pf > 0) {
+            _mm_prefetch((const char*) (x0 + ib) + pf, _MM_HINT_T0);
+            _mm_prefetch((const char*) (x1 + ib) + pf, _MM_HINT_T0);
+        }
+        const __m512i c0 = codes64_0213(x0[ib].qs, m4);
+        const __m512i g0 = _mm512_shuffle_epi8(mag, c0);
+        const __mmask64 n0 = _mm512_test_epi8_mask(c0, eight);
+        const __m512 sw0 = sub_scales_0213(x0[ib].d, dup4_idx);
+
+        const __m512i c1 = codes64_0213(x1[ib].qs, m4);
+        const __m512i g1 = _mm512_shuffle_epi8(mag, c1);
+        const __mmask64 n1 = _mm512_test_epi8_mask(c1, eight);
+        const __m512 sw1 = sub_scales_0213(x1[ib].d, dup4_idx);
+
+        for (int t = 0; t < NT; ++t) {
+            const __m512i q = _mm512_load_si512((const __m512i*) (q_ptrs[t] + (size_t) ib * 64));
+            const __m512 dy = _mm512_load_ps(dy_ptrs[t] + (size_t) ib * 16);
+
+            const __m512i qs0 = _mm512_mask_sub_epi8(q, n0, zero, q);
+            const __m512i p16_0 = _mm512_maddubs_epi16(g0, qs0);
+            const __m512i p32_0 = _mm512_madd_epi16(p16_0, ones);
+            a0[t] = _mm512_fmadd_ps(_mm512_mul_ps(sw0, dy), _mm512_cvtepi32_ps(p32_0), a0[t]);
+
+            const __m512i qs1 = _mm512_mask_sub_epi8(q, n1, zero, q);
+            const __m512i p16_1 = _mm512_maddubs_epi16(g1, qs1);
+            const __m512i p32_1 = _mm512_madd_epi16(p16_1, ones);
+            a1[t] = _mm512_fmadd_ps(_mm512_mul_ps(sw1, dy), _mm512_cvtepi32_ps(p32_1), a1[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        res0[t] = _mm512_reduce_add_ps(a0[t]);
+        res1[t] = _mm512_reduce_add_ps(a1[t]);
+    }
+}
+
 template <int NT>
 void gu_rows_multi(const uint8_t* gate, const uint8_t* up, size_t row_bytes, int nb,
                    const uint8_t* const* q_ptrs, const float* const* dy_ptrs,
@@ -288,8 +346,13 @@ void gu_rows_multi(const uint8_t* gate, const uint8_t* up, size_t row_bytes, int
             for (int k = 0; k < 64; ++k) {
                 const int r = rb + k;
                 float g[NT], u[NT];
-                row_dot_multi<NT>(gate + (size_t) r * row_bytes, q_ptrs, dy_ptrs, nb, g);
-                row_dot_multi<NT>(up + (size_t) r * row_bytes, q_ptrs, dy_ptrs, nb, u);
+                if constexpr (NT <= 6) {
+                    row2_dot_multi<NT>(gate + (size_t) r * row_bytes, up + (size_t) r * row_bytes,
+                                       q_ptrs, dy_ptrs, nb, g, u);
+                } else {
+                    row_dot_multi<NT>(gate + (size_t) r * row_bytes, q_ptrs, dy_ptrs, nb, g);
+                    row_dot_multi<NT>(up + (size_t) r * row_bytes, q_ptrs, dy_ptrs, nb, u);
+                }
                 for (int t = 0; t < NT; ++t) {
                     hbuf[t][k] = apply_act(g[t], u[t], gate_scale, up_scale, limit, gelu, situ);
                 }
@@ -305,8 +368,13 @@ void gu_rows_multi(const uint8_t* gate, const uint8_t* up, size_t row_bytes, int
     }
     for (int r = r0; r < r1; ++r) {
         float g[NT], u[NT];
-        row_dot_multi<NT>(gate + (size_t) r * row_bytes, q_ptrs, dy_ptrs, nb, g);
-        row_dot_multi<NT>(up + (size_t) r * row_bytes, q_ptrs, dy_ptrs, nb, u);
+        if constexpr (NT <= 6) {
+            row2_dot_multi<NT>(gate + (size_t) r * row_bytes, up + (size_t) r * row_bytes,
+                               q_ptrs, dy_ptrs, nb, g, u);
+        } else {
+            row_dot_multi<NT>(gate + (size_t) r * row_bytes, q_ptrs, dy_ptrs, nb, g);
+            row_dot_multi<NT>(up + (size_t) r * row_bytes, q_ptrs, dy_ptrs, nb, u);
+        }
         for (int t = 0; t < NT; ++t) {
             h_out[(size_t) exp_slots[t] * (size_t) n_ff + (size_t) r] =
                 apply_act(g[t], u[t], gate_scale, up_scale, limit, gelu, situ);
@@ -318,7 +386,22 @@ template <int NT>
 void down_expert_multi(const uint8_t* down, size_t d_row, int nb,
                        const uint8_t* const* q_ptrs, const float* const* dy_ptrs,
                        const int* exp_slots, float* scratch, int r_count, int n_experts, int r0) {
-    for (int k = 0; k < r_count; ++k) {
+    int k = 0;
+    if constexpr (NT <= 6) {
+        for (; k + 1 < r_count; k += 2) {
+            float res0[NT], res1[NT];
+            row2_dot_multi<NT>(down + (size_t) (r0 + k) * d_row,
+                               down + (size_t) (r0 + k + 1) * d_row,
+                               q_ptrs, dy_ptrs, nb, res0, res1);
+            float* s0 = scratch + (size_t) k * (size_t) n_experts;
+            float* s1 = scratch + (size_t) (k + 1) * (size_t) n_experts;
+            for (int t = 0; t < NT; ++t) {
+                s0[exp_slots[t]] = res0[t];
+                s1[exp_slots[t]] = res1[t];
+            }
+        }
+    }
+    for (; k < r_count; ++k) {
         float res[NT];
         row_dot_multi<NT>(down + (size_t) (r0 + k) * d_row, q_ptrs, dy_ptrs, nb, res);
         float* row_s = scratch + (size_t) k * (size_t) n_experts;

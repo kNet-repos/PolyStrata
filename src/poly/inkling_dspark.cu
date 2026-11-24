@@ -167,16 +167,50 @@ __global__ void recur_kernel(const float* j, const float* bias, float* state, fl
     latent[i] = tanhf(j[2 * kRank + i] + bias[2 * kRank + i]);
 }
 
-__global__ void head_kernel(const float* base, const float* bias2, const uint16_t* w2, const float* latent,
-                            float* logits, int n, float cap) {
+// Custom RDNA2 wave32 coalesced 2-vocab-per-thread DSpark head projection:
+// 32-bit packed loads (bf16x2 or half2) halve LDS/loop overhead and saturate 128B cache-line bus.
+template <bool kBf16>
+__global__ void __launch_bounds__(kRank)
+head_kernel_vec2(const float* __restrict__ base, const float* __restrict__ bias2, const uint32_t* __restrict__ w2_pair,
+                 const float* __restrict__ latent, float* __restrict__ logits,
+                 int n_active, int n_total, int ld_pairs, float cap) {
     __shared__ float lat[kRank];
     lat[threadIdx.x] = latent[threadIdx.x];
     __syncthreads();
-    const int v = blockIdx.x * blockDim.x + threadIdx.x;
-    if (v >= n) return;
-    float acc = 0.f;
-    for (int i = 0; i < kRank; ++i) acc = __fmaf_rn(lat[i], __half2float(__ushort_as_half(w2[(size_t) i * n + v])), acc);
-    logits[v] = cap * tanhf((base[v] + bias2[v] + acc) / cap);
+    const int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int v0 = pair_idx * 2;
+    if (v0 >= n_total) return;
+    if (v0 >= n_active) {
+        logits[v0] = -INFINITY;
+        if (v0 + 1 < n_total) logits[v0 + 1] = -INFINITY;
+        return;
+    }
+    float acc0 = 0.f, acc1 = 0.f;
+    const uint32_t* wp = w2_pair + pair_idx;
+#pragma unroll 8
+    for (int i = 0; i < kRank; ++i) {
+        const uint32_t p = wp[(size_t) i * (size_t) ld_pairs];
+        const float l = lat[i];
+        float w0, w1;
+        if constexpr (kBf16) {
+            w0 = __uint_as_float(p << 16);
+            w1 = __uint_as_float(p & 0xFFFF0000u);
+        } else {
+            const float2 f2 = __half22float2(__halves2half2(__ushort_as_half((uint16_t) p),
+                                                            __ushort_as_half((uint16_t) (p >> 16))));
+            w0 = f2.x;
+            w1 = f2.y;
+        }
+        acc0 = __fmaf_rn(l, w0, acc0);
+        acc1 = __fmaf_rn(l, w1, acc1);
+    }
+    const float inv_cap = 1.f / cap;
+    logits[v0] = cap * tanhf((base[v0] + bias2[v0] + acc0) * inv_cap);
+    if (v0 + 1 < n_active) {
+        logits[v0 + 1] = cap * tanhf((base[v0 + 1] + bias2[v0 + 1] + acc1) * inv_cap);
+    } else if (v0 + 1 < n_total) {
+        logits[v0 + 1] = -INFINITY;
+    }
 }
 
 __global__ void fill_rows_kernel(const float* src, float* dst, int width, int rows) {
@@ -216,9 +250,18 @@ void recur(const float* j, const float* bias, float* state, float* latent, cudaS
     recur_kernel<<<1, kRank, 0, st>>>(j, bias, state, latent);
 }
 
-void head(const float* base, const float* bias2, const uint16_t* w2, const float* latent, float* logits, int n,
-          float cap, cudaStream_t st) {
-    head_kernel<<<div_up(n, kRank), kRank, 0, st>>>(base, bias2, w2, latent, logits, n, cap);
+void head(const float* base, const float* bias2, const uint16_t* w2, const float* latent, float* logits,
+          int n_active, int n_total, int ld, bool w2_bf16, float cap, cudaStream_t st) {
+    const int n_pairs = (n_total + 1) / 2;
+    const int ld_pairs = ld / 2;
+    const dim3 grid(div_up(n_pairs, kRank));
+    if (w2_bf16) {
+        head_kernel_vec2<true><<<grid, kRank, 0, st>>>(base, bias2, (const uint32_t*) w2, latent, logits,
+                                                       n_active, n_total, ld_pairs, cap);
+    } else {
+        head_kernel_vec2<false><<<grid, kRank, 0, st>>>(base, bias2, (const uint32_t*) w2, latent, logits,
+                                                        n_active, n_total, ld_pairs, cap);
+    }
 }
 
 void fill_rows(const float* src, float* dst, int width, int rows, cudaStream_t st) {

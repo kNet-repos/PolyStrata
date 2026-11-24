@@ -42,9 +42,10 @@ void joint(const float* state, const float* w1, const float* hidden, const float
 /// latent tanh of the third part.
 void recur(const float* j, const float* bias, float* state, float* latent, cudaStream_t st);
 
-/// logits[v] = cap tanh((base[v] + bias2[v] + sum_i latent[i] w2[i][v]) / cap), w2 half [kRank][n].
-void head(const float* base, const float* bias2, const uint16_t* w2, const float* latent, float* logits, int n,
-          float cap, cudaStream_t st);
+/// logits[v] = cap tanh((base[v] + bias2[v] + sum_i latent[i] w2[i][v]) / cap) for v < n_active,
+/// -INFINITY for n_active <= v < n_total. w2 is [kRank][ld] (ld even) in BF16 (w2_bf16=true) or F16.
+void head(const float* base, const float* bias2, const uint16_t* w2, const float* latent, float* logits,
+          int n_active, int n_total, int ld, bool w2_bf16, float cap, cudaStream_t st);
 
 /// dst[r] = src for rows 0 .. rows - 1 of width floats.
 void fill_rows(const float* src, float* dst, int width, int rows, cudaStream_t st);
