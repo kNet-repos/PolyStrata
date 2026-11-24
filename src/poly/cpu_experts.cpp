@@ -1,11 +1,13 @@
 // src/poly/cpu_experts.cpp - see the header.
 #include "cpu_experts.hpp"
+#include "cpu_experts_nvfp4_avx512.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 #include <mutex>
@@ -121,6 +123,23 @@ void Workers::run(int n, const std::function<void(int)>& fn) {
     while (users_.load() != 0) _mm_pause();
 }
 
+
+bool nvfp4_avx512_skx_supported() noexcept {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static const bool ok = [] {
+        if (const char* e = std::getenv("STRATA_CPU_NVFP4_AVX512")) {
+            if (std::atoi(e) == 0) return false;
+        }
+        return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+               __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl") &&
+               __builtin_cpu_supports("f16c") && __builtin_cpu_supports("fma");
+    }();
+    return ok;
+#else
+    return false;
+#endif
+}
+
 bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::string& err) {
     init_once();
     for (const int type : {gu_type, d_type}) {
@@ -144,6 +163,81 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                   const std::function<void()>* meanwhile, const uint8_t* late, const std::function<void(int)>* wait,
                   SiTU situ) {
     init_once();
+    const bool avx512_ok = nvfp4_avx512_skx_supported();
+    const bool nvfp4_fused = avx512_ok && gu_type == GGML_TYPE_NVFP4 && u_type == GGML_TYPE_NVFP4 &&
+                             d_type == GGML_TYPE_NVFP4 && (n_embd % 64 == 0) && n_embd <= 4096 &&
+                             (n_ff % 64 == 0) && n_ff <= 4096;
+    if (nvfp4_fused) {
+        const size_t gu_row = ggml_row_size(GGML_TYPE_NVFP4, n_embd);
+        const size_t d_row = ggml_row_size(GGML_TYPE_NVFP4, n_ff);
+        static thread_local Nvfp4PackedActs512 in_acts, h_acts;
+        static thread_local std::vector<int> by, run, order;
+        in_acts.prepare(rows, n_embd);
+        h_acts.prepare(n, n_ff);
+        Nvfp4PackedActs512* in_acts_p = &in_acts;
+        Nvfp4PackedActs512* h_acts_p = &h_acts;
+        if (rows == 1) {
+            nvfp4_quantize_and_pack_f32_avx512(x, 0, n_embd, *in_acts_p);
+        } else {
+            workers.run(rows, [&](int t) {
+                nvfp4_quantize_and_pack_f32_avx512(x + (size_t) t * (size_t) n_embd, t, n_embd, *in_acts_p);
+            });
+        }
+        by.resize((size_t) n);
+        std::iota(by.begin(), by.end(), 0);
+        std::stable_sort(by.begin(), by.end(), [&](int a, int b) { return experts[a].gate < experts[b].gate; });
+        run.clear();
+        for (int i = 0; i < n; ++i)
+            if (i == 0 || experts[by[(size_t) i]].gate != experts[by[(size_t) i - 1]].gate) run.push_back(i);
+        const int n_run = (int) run.size();
+        run.push_back(n);
+        order.resize((size_t) n_run);
+        std::iota(order.begin(), order.end(), 0);
+        if (late)
+            std::stable_partition(order.begin(), order.end(),
+                                  [&](int u) { return !late[by[(size_t) run[(size_t) u]]]; });
+
+        const int* byp = by.data();
+        const int* runp = run.data();
+        const int* orderp = order.data();
+        constexpr int kGuRows512 = 64;
+        const int gu_tasks = n_ff / kGuRows512;
+        const int first = meanwhile ? 1 : 0;
+        workers.run(first + n_run * gu_tasks, [&](int t) {
+            if (t < first) return (*meanwhile)();
+            t -= first;
+            const int u = orderp[t / gu_tasks], i0 = runp[u], i1 = runp[u + 1];
+            if (late && late[byp[i0]]) (*wait)(byp[i0]);
+            const CpuExpert& e = experts[byp[i0]];
+            const int r0 = (t % gu_tasks) * kGuRows512, r1 = r0 + kGuRows512;
+            const int nt = i1 - i0;
+            int tok_rows_stack[64], exp_slots_stack[64];
+            std::vector<int> tok_rows_vec, exp_slots_vec;
+            int* tok_rows_p = tok_rows_stack;
+            int* exp_slots_p = exp_slots_stack;
+            if (nt > 64) {
+                tok_rows_vec.resize((size_t) nt);
+                exp_slots_vec.resize((size_t) nt);
+                tok_rows_p = tok_rows_vec.data();
+                exp_slots_p = exp_slots_vec.data();
+            }
+            for (int k = 0; k < nt; ++k) {
+                const int j = byp[i0 + k];
+                tok_rows_p[k] = experts[j].row;
+                exp_slots_p[k] = j;
+            }
+            nvfp4_gu_rows_avx512(e.gate, e.up, gu_row, n_embd, *in_acts_p, tok_rows_p, exp_slots_p, nt,
+                                 e.gate_scale, e.up_scale, limit, gelu, situ, h_acts_p, nullptr, n_ff, r0, r1);
+        });
+
+        constexpr int kDownRows512 = 32;
+        const int d_tasks = (n_embd + kDownRows512 - 1) / kDownRows512;
+        workers.run(d_tasks, [&](int t) {
+            const int r0 = t * kDownRows512, r1 = std::min(n_embd, r0 + kDownRows512);
+            nvfp4_down_rows_avx512(experts, byp, runp, n_run, n, rows, d_row, n_ff, n_embd, *h_acts_p, out, r0, r1);
+        });
+        return;
+    }
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* tu = traits(u_type);
     const ggml_type_traits_cpu* td = traits(d_type);
@@ -166,8 +260,11 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     // ggml's quantizers for the activations are scalar: microseconds a row, which on one thread kept the others
     // waiting, here and before the down products
     uint8_t* actp = act.data();
-    const auto act_from = traits(tg->vec_dot_type)->from_float;
-    workers.run(rows, [&](int t) { act_from(x + (size_t) t * n_embd, actp + (size_t) t * a_bytes, n_embd); });
+    const auto act_from = (avx512_ok && tg->vec_dot_type == GGML_TYPE_Q8_0 && n_embd % 32 == 0)
+                              ? [](const float* src, void* dst, int64_t k) { quantize_row_q8_0_avx512(src, dst, (int) k); }
+                              : traits(tg->vec_dot_type)->from_float;
+    if (rows == 1) act_from(x, actp, n_embd);
+    else workers.run(rows, [&](int t) { act_from(x + (size_t) t * n_embd, actp + (size_t) t * a_bytes, n_embd); });
     uint8_t* actup = actp;
     if (own_act) {
         actup = act_u.data();
@@ -234,7 +331,9 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         }
     });
     uint8_t* hqp = hq.data();
-    const auto hq_from = traits(td->vec_dot_type)->from_float;
+    const auto hq_from = (avx512_ok && td->vec_dot_type == GGML_TYPE_Q8_0 && n_ff % 32 == 0)
+                             ? [](const float* src, void* dst, int64_t k) { quantize_row_q8_0_avx512(src, dst, (int) k); }
+                             : traits(td->vec_dot_type)->from_float;
     workers.run(n, [&](int j) { hq_from(hp + (size_t) j * n_ff, hqp + (size_t) j * h_bytes, n_ff); });
 
     const int d_tasks = (n_embd + kRowsPerDownTask - 1) / kRowsPerDownTask;

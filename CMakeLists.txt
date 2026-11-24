@@ -2106,16 +2106,24 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     # Optional model/state check; run by hand with an MTP GGUF and frozen prompt IDs.
     add_executable(poly_gdn_mma_state_test src/poly/gdn_mma_state_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                    src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp
-                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
+                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/cpu_experts_nvfp4_avx512.cpp src/poly/kernels.cu
                    src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
     target_include_directories(poly_gdn_mma_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(poly_gdn_mma_state_test PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
                          ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} CUDA::cuda_driver Threads::Threads)
   endif()
 
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    if(MSVC)
+      set_source_files_properties(src/poly/cpu_experts_nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    else()
+      set_source_files_properties(src/poly/cpu_experts_nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                                  "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mf16c;-mfma")
+    endif()
+  endif()
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
-                            src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
+                            src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/cpu_experts_nvfp4_avx512.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                             src/poly/spill.cpp src/poly/disk_sessions.cpp src/core/conversation_memory.cpp
                             src/core/conversation_file.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
@@ -2131,7 +2139,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                            ${_strata_poly_driver}
                                            Threads::Threads)
   # needs the model file, so it is run by hand: poly_expert_parity MODEL.gguf
-  add_executable(poly_expert_parity src/poly/expert_parity.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu)
+  add_executable(poly_expert_parity src/poly/expert_parity.cpp src/poly/cpu_experts.cpp src/poly/cpu_experts_nvfp4_avx512.cpp src/poly/kernels.cu)
   target_include_directories(poly_expert_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                        ${_strata_gpu_include_directories})
   target_link_libraries(poly_expert_parity PRIVATE strata_poly_mmq strata_kernels ggml-cpu ggml-base
@@ -2142,7 +2150,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_draft_race_test src/poly/draft_race_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                                       src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
                                       src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp
-                                      src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
+                                      src/poly/cpu_experts.cpp src/poly/cpu_experts_nvfp4_avx512.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                                       src/core/conversation_memory.cpp)
   if(STRATA_ENABLE_HIP)
     target_sources(strata-poly PRIVATE src/poly/inkling2.cu src/poly/inkling_attend.cu src/poly/inkling_attend_lean.cu src/poly/inkling_attend_h2.cu src/poly/inkling_dspark.cu)
@@ -2261,7 +2269,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                                    ${_strata_gpu_include_directories})
   target_link_libraries(poly_dsv4_test PRIVATE ${_strata_gpu_runtime_target})
   # the pool of the CPU experts, without a model
-  add_executable(poly_workers_test src/poly/workers_test.cpp src/poly/cpu_experts.cpp)
+  add_executable(poly_workers_test src/poly/workers_test.cpp src/poly/cpu_experts.cpp src/poly/cpu_experts_nvfp4_avx512.cpp)
   target_include_directories(poly_workers_test PRIVATE ${_strata_gg}/include)
   target_link_libraries(poly_workers_test PRIVATE ggml-cpu ggml-base Threads::Threads)
   add_test(NAME poly_workers_test COMMAND poly_workers_test)
