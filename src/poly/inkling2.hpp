@@ -129,16 +129,19 @@ private:
     std::vector<float> ds_hidden_, ds_hidden_b_;   // old dspark_hidden_out [kWidth][kDsRank] and its bias
     float ds_eps_ = 0, ds_cap_ = 0, ds_theta_ = 0;
     int ds_vocab_ = 0, ds_w2_ld_ = 0;
-    bool ds_mainline_ = false, ds_w1_bf16_ = false, ds_w2_bf16_ = false;
+    bool ds_mainline_ = false, ds_w1_bf16_ = false, ds_w2_bf16_ = false, ds_compact_ = false;
     bool ds_head_ready_ = false;
-    float* ds_taps_ = nullptr;              // the rows entering visits kTap of the last call, rows_ apart
+    float* ds_taps_ = nullptr;
+    uint16_t* ds_taps_f16_ = nullptr;              // the rows entering visits kTap of the last call, rows_ apart
     float *ds_x_ = nullptr, *ds_xa_ = nullptr, *ds_q_ = nullptr, *ds_qr_ = nullptr, *ds_k_ = nullptr,
           *ds_kr_ = nullptr, *ds_v_ = nullptr, *ds_ao_ = nullptr, *ds_out_ = nullptr, *ds_g_ = nullptr,
           *ds_u_ = nullptr, *ds_h_ = nullptr, *ds_cur_ = nullptr, *ds_base_ = nullptr, *ds_state_ = nullptr,
           *ds_w1row_ = nullptr, *ds_jx_ = nullptr, *ds_jo_ = nullptr, *ds_lat_ = nullptr, *ds_att_ = nullptr,
           *ds_b2_ = nullptr;
     float* ds_host_ = nullptr;              // pinned: a markov_w1 row, or prepare_head()'s rows, on their way
-    uint16_t* ds_w2_ = nullptr;             // W_head W_hidden_out, half [kDsRank][n_vocab_]
+    uint16_t* ds_w2_ = nullptr;             // W_head W_hidden_out or mainline markov_w2 [kDsRank][ds_w2_ld_]
+    int8_t* ds_w2_i8_ = nullptr;            // compact INT8 markov_w2 [kDsRank][ds_w2_ld_]
+    float* ds_w2_scale_ = nullptr;          // compact INT8 per-row scales [kDsRank]
     int ds_rows_ = 0;                       // the guesses a block has (base rows): min(7, window - 1)
     int ds_based_ = 0;                      // the block's rows whose head logits ds_base_ holds
     void load_drafter_shape(const Shards& g);

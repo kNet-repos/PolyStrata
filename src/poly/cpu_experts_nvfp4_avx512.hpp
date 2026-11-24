@@ -19,6 +19,8 @@ bool nvfp4_avx512_skx_supported() noexcept;
 
 // Fast AVX-512F Q8_0 quantizer (32-element blocks).
 void quantize_row_q8_0_avx512(const float* x, void* vy, int n);
+// Fast bit-exact AVX-512F Q8_K quantizer (256-element blocks, replaces ggml scalar ref).
+void quantize_row_q8_K_avx512(const float* x, void* vy, int n);
 
 // 64-byte aligned packed Q8_0 activations in [sub0, sub2, sub1, sub3] order for zero-permute NVFP4 dot.
 struct Nvfp4PackedActs512 {

@@ -673,4 +673,57 @@ void nvfp4_down_rows_avx512(const CpuExpert* experts, const int* by, const int* 
     }
 }
 
+
+struct block_q8_K_local {
+    float d;
+    int8_t qs[256];
+    int16_t bsums[16];
+};
+static_assert(sizeof(block_q8_K_local) == 292, "block_q8_K size mismatch");
+
+void quantize_row_q8_K_avx512(const float* x, void* vy, int n) {
+    auto* y = (block_q8_K_local*) vy;
+    const int nb = n / 256;
+    const __m512i v_min = _mm512_set1_epi32(-127);
+    const __m512i v_max = _mm512_set1_epi32(127);
+    const __m512 sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+
+    for (int i = 0; i < nb; ++i) {
+        const float* xi = x + (size_t) i * 256;
+        __m512 v[16];
+        __m512 vmax0 = _mm512_setzero_ps(), vmax1 = _mm512_setzero_ps();
+        for (int g = 0; g < 16; g += 2) {
+            v[g] = _mm512_loadu_ps(xi + g * 16);
+            v[g + 1] = _mm512_loadu_ps(xi + (g + 1) * 16);
+            vmax0 = _mm512_max_ps(vmax0, _mm512_and_ps(v[g], sign_mask));
+            vmax1 = _mm512_max_ps(vmax1, _mm512_and_ps(v[g + 1], sign_mask));
+        }
+        const float amax = _mm512_reduce_max_ps(_mm512_max_ps(vmax0, vmax1));
+        if (amax == 0.f) {
+            y[i].d = 0.f;
+            std::memset(y[i].qs, 0, sizeof(y[i].qs));
+            std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
+        }
+        const __m512 vamax = _mm512_set1_ps(amax);
+        float max_signed = amax;
+        for (int g = 0; g < 16; ++g) {
+            const __mmask16 m = _mm512_cmp_ps_mask(_mm512_and_ps(v[g], sign_mask), vamax, _CMP_EQ_OQ);
+            if (m) {
+                max_signed = xi[g * 16 + __builtin_ctz((unsigned) m)];
+                break;
+            }
+        }
+        const float iscale = -127.f / max_signed;
+        y[i].d = 1.f / iscale;
+        const __m512 visc = _mm512_set1_ps(iscale);
+        for (int g = 0; g < 16; ++g) {
+            __m512i q32 = _mm512_cvtps_epi32(_mm512_mul_ps(v[g], visc));
+            q32 = _mm512_min_epi32(_mm512_max_epi32(q32, v_min), v_max);
+            _mm_storeu_si128((__m128i*) (y[i].qs + g * 16), _mm512_cvtepi32_epi8(q32));
+            y[i].bsums[g] = (int16_t) _mm512_reduce_add_epi32(q32);
+        }
+    }
+}
+
 }  // namespace strata::poly

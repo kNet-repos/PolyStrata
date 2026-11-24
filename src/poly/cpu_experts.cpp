@@ -6,6 +6,8 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -124,6 +126,35 @@ void Workers::run(int n, const std::function<void(int)>& fn) {
 }
 
 
+
+namespace {
+struct CpuProf {
+    bool on = false;
+    double pack_ms = 0, gu_ms = 0, down_ms = 0, other_ms = 0;
+    long long calls_nvfp4 = 0, calls_other = 0, total_experts_nvfp4 = 0, total_experts_other = 0;
+    long long runs_nt1 = 0, runs_nt2p = 0;
+    CpuProf() {
+        const char* e = std::getenv("STRATA_CPU_PROF");
+        on = e && std::atoi(e) != 0;
+    }
+    ~CpuProf() {
+        if (on) {
+            std::fprintf(stderr,
+                "STRATA_CPU_PROF: nvfp4_calls=%lld (exps=%lld, runs_nt1=%lld, runs_nt2+=%lld) pack=%.1fms gu=%.1fms down=%.1fms | other_calls=%lld (exps=%lld) other=%.1fms\n",
+                calls_nvfp4, total_experts_nvfp4, runs_nt1, runs_nt2p, pack_ms, gu_ms, down_ms,
+                calls_other, total_experts_other, other_ms);
+        }
+    }
+};
+CpuProf& cpu_prof() {
+    static CpuProf p;
+    return p;
+}
+inline double ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+} // namespace
+
 bool nvfp4_avx512_skx_supported() noexcept {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     static const bool ok = [] {
@@ -167,6 +198,8 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     const bool nvfp4_fused = avx512_ok && gu_type == GGML_TYPE_NVFP4 && u_type == GGML_TYPE_NVFP4 &&
                              d_type == GGML_TYPE_NVFP4 && (n_embd % 64 == 0) && n_embd <= 4096 &&
                              (n_ff % 64 == 0) && n_ff <= 4096;
+    auto& prof = cpu_prof();
+    const auto t_call0 = prof.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (nvfp4_fused) {
         const size_t gu_row = ggml_row_size(GGML_TYPE_NVFP4, n_embd);
         const size_t d_row = ggml_row_size(GGML_TYPE_NVFP4, n_ff);
@@ -202,6 +235,16 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         const int* orderp = order.data();
         constexpr int kGuRows512 = 64;
         const int gu_tasks = n_ff / kGuRows512;
+        const auto t_gu0 = prof.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (prof.on) {
+            prof.pack_ms += ms_since(t_call0);
+            prof.calls_nvfp4++;
+            prof.total_experts_nvfp4 += n;
+            for (int u = 0; u < n_run; ++u) {
+                if (runp[u + 1] - runp[u] == 1) prof.runs_nt1++;
+                else prof.runs_nt2p++;
+            }
+        }
         const int first = meanwhile ? 1 : 0;
         workers.run(first + n_run * gu_tasks, [&](int t) {
             if (t < first) return (*meanwhile)();
@@ -230,14 +273,18 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                                  e.gate_scale, e.up_scale, limit, gelu, situ, h_acts_p, nullptr, n_ff, r0, r1);
         });
 
+        const auto t_dn0 = prof.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (prof.on) prof.gu_ms += ms_since(t_gu0);
         constexpr int kDownRows512 = 32;
         const int d_tasks = (n_embd + kDownRows512 - 1) / kDownRows512;
         workers.run(d_tasks, [&](int t) {
             const int r0 = t * kDownRows512, r1 = std::min(n_embd, r0 + kDownRows512);
             nvfp4_down_rows_avx512(experts, byp, runp, n_run, n, rows, d_row, n_ff, n_embd, *h_acts_p, out, r0, r1);
         });
+        if (prof.on) prof.down_ms += ms_since(t_dn0);
         return;
     }
+
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* tu = traits(u_type);
     const ggml_type_traits_cpu* td = traits(d_type);
@@ -262,7 +309,9 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     uint8_t* actp = act.data();
     const auto act_from = (avx512_ok && tg->vec_dot_type == GGML_TYPE_Q8_0 && n_embd % 32 == 0)
                               ? [](const float* src, void* dst, int64_t k) { quantize_row_q8_0_avx512(src, dst, (int) k); }
-                              : traits(tg->vec_dot_type)->from_float;
+                              : (avx512_ok && tg->vec_dot_type == GGML_TYPE_Q8_K && n_embd % 256 == 0)
+                                    ? [](const float* src, void* dst, int64_t k) { quantize_row_q8_K_avx512(src, dst, (int) k); }
+                                    : traits(tg->vec_dot_type)->from_float;
     if (rows == 1) act_from(x, actp, n_embd);
     else workers.run(rows, [&](int t) { act_from(x + (size_t) t * n_embd, actp + (size_t) t * a_bytes, n_embd); });
     uint8_t* actup = actp;
@@ -305,6 +354,10 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         for (int r = r0; r < r1; ++r) {
             const uint8_t* gate = e.gate + (size_t) r * gu_row;
             const uint8_t* up = e.up + (size_t) r * u_row;
+            if (r + 2 < r1) {
+                _mm_prefetch((const char*) (gate + 2 * gu_row), _MM_HINT_T0);
+                _mm_prefetch((const char*) (up + 2 * u_row), _MM_HINT_T0);
+            }
             for (int i = i0; i < i1; ++i) {
                 const int j = byp[i];
                 const uint8_t* a = actp + (size_t) experts[j].row * a_bytes;
@@ -333,30 +386,46 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     uint8_t* hqp = hq.data();
     const auto hq_from = (avx512_ok && td->vec_dot_type == GGML_TYPE_Q8_0 && n_ff % 32 == 0)
                              ? [](const float* src, void* dst, int64_t k) { quantize_row_q8_0_avx512(src, dst, (int) k); }
-                             : traits(td->vec_dot_type)->from_float;
+                             : (avx512_ok && td->vec_dot_type == GGML_TYPE_Q8_K && n_ff % 256 == 0)
+                                   ? [](const float* src, void* dst, int64_t k) { quantize_row_q8_K_avx512(src, dst, (int) k); }
+                                   : traits(td->vec_dot_type)->from_float;
     workers.run(n, [&](int j) { hq_from(hp + (size_t) j * n_ff, hqp + (size_t) j * h_bytes, n_ff); });
 
-    const int d_tasks = (n_embd + kRowsPerDownTask - 1) / kRowsPerDownTask;
+    constexpr int kDownRowsGen = 32;
+    const int d_tasks = (n_embd + kDownRowsGen - 1) / kDownRowsGen;
     workers.run(d_tasks, [&](int t) {
-        static thread_local std::vector<float> one;   // an output value of every use
-        one.resize((size_t) n);
-        float* s = one.data();
-        const int r0 = t * kRowsPerDownTask, r1 = std::min(n_embd, r0 + kRowsPerDownTask);
-        for (int r = r0; r < r1; ++r) {
-            for (int u = 0; u < n_run; ++u) {
-                const uint8_t* down = experts[byp[runp[u]]].down + (size_t) r * d_row;
-                for (int i = runp[u]; i < runp[u + 1]; ++i)
-                    td->vec_dot(n_ff, s + byp[i], 0, down, 0, hqp + (size_t) byp[i] * h_bytes, 0, 1);
+        static thread_local std::vector<float> sbuf;
+        const int r0 = t * kDownRowsGen, r1 = std::min(n_embd, r0 + kDownRowsGen);
+        const int nr = r1 - r0;
+        sbuf.resize((size_t) nr * (size_t) n);
+        float* sb = sbuf.data();
+        // Expert-outer loop for sequential weight streaming + hardware/software prefetching.
+        for (int u = 0; u < n_run; ++u) {
+            const uint8_t* base = experts[byp[runp[u]]].down + (size_t) r0 * d_row;
+            const int i0 = runp[u], i1 = runp[u + 1];
+            for (int r = 0; r < nr; ++r) {
+                const uint8_t* down = base + (size_t) r * d_row;
+                if (r + 2 < nr) _mm_prefetch((const char*) (down + 2 * d_row), _MM_HINT_T0);
+                float* sr = sb + (size_t) r * n;
+                for (int i = i0; i < i1; ++i)
+                    td->vec_dot(n_ff, sr + byp[i], 0, down, 0, hqp + (size_t) byp[i] * h_bytes, 0, 1);
             }
-            // a token's sum in the order its experts were given: the order it has in a call of its own
+        }
+        for (int r = 0; r < nr; ++r) {
+            const float* sr = sb + (size_t) r * n;
             int j = 0;
             for (int row = 0; row < rows; ++row) {
                 float acc = 0.f;
-                for (; j < n && experts[j].row == row; ++j) acc += experts[j].weight * s[j];
-                out[(size_t) row * n_embd + r] = acc;
+                for (; j < n && experts[j].row == row; ++j) acc += experts[j].weight * sr[j];
+                out[(size_t) row * n_embd + (r0 + r)] = acc;
             }
         }
     });
+    if (prof.on) {
+        prof.calls_other++;
+        prof.total_experts_other += n;
+        prof.other_ms += ms_since(t_call0);
+    }
 }
 
 }  // namespace strata::poly

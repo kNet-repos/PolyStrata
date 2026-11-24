@@ -20,6 +20,13 @@ struct Taps {
     float w[kTaps];
 };
 void mix_taps(const Taps& t, const float* norm, float* out, int first, int n, float eps, cudaStream_t st);
+struct TapsF16 {
+    const uint16_t* tap[3];
+    const float* last;
+    float w[kTaps];
+};
+void store_tap_f16(const float* src, uint16_t* dst, size_t n_floats, cudaStream_t st);
+void mix_taps_f16(const TapsF16& t, const float* norm, float* out, int first, int n, float eps, cudaStream_t st);
 
 /// One side of a draft cache: ggml Q8_0 rows of kKey codes and kKey / 32 half scales.
 struct Q8Rows {
@@ -46,6 +53,10 @@ void recur(const float* j, const float* bias, float* state, float* latent, cudaS
 /// -INFINITY for n_active <= v < n_total. w2 is [kRank][ld] (ld even) in BF16 (w2_bf16=true) or F16.
 void head(const float* base, const float* bias2, const uint16_t* w2, const float* latent, float* logits,
           int n_active, int n_total, int ld, bool w2_bf16, float cap, cudaStream_t st);
+
+/// Quantized INT8 DSpark head: w2_i8 is [kRank][ld] (ld multiple of 4), w2_scale is [kRank] FP32.
+void head_i8(const float* base, const float* bias2, const int8_t* w2_i8, const float* w2_scale, const float* latent,
+             float* logits, int n_active, int n_total, int ld, float cap, cudaStream_t st);
 
 /// dst[r] = src for rows 0 .. rows - 1 of width floats.
 void fill_rows(const float* src, float* dst, int width, int rows, cudaStream_t st);

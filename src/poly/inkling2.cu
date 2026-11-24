@@ -676,7 +676,11 @@ void Inkling2::load_drafter_shape(const Shards& g) {
          "markov_w1 is not F16/BF16 [256, vocabulary]");
     ds_w1_bf16_ = (w1->type == GGML_TYPE_BF16);
     ds_vocab_ = (int) w1->shape[1];
-    ds_w2_ld_ = (ds_vocab_ + 1) & ~1;
+    ds_w2_ld_ = (ds_vocab_ + 3) & ~3;
+    ds_compact_ = ds_mainline_ && [] {
+        const char* e = std::getenv("STRATA_DSPARK_COMPACT");
+        return !e || std::atoi(e) != 0;
+    }();
     if (ds_mainline_) {
         const TensorInfo* w2 = g.find("markov_w2.weight");
         const TensorInfo* b2 = g.find("markov_w2.bias");
@@ -779,24 +783,25 @@ void Inkling2::load_drafter() {
         if (!t) throw std::runtime_error(opt_.draft_model + " has no " + name);
         return upload(t, name, n_in, n_out, want);
     };
+    const Want ds_mat = ds_compact_ ? kGuessMat : kAnyMat;
     for (int l = 0; l < kDsLayers; ++l) {
         DsLayer& L = ds_[(size_t) l];
         const auto name = [&](const char* n) { return "blk." + std::to_string(l) + "." + n; };
         L.attn_norm = up(name("attn_norm.weight"), kWidth, 1, kF32);
         L.ffn_norm = up(name("ffn_norm.weight"), kWidth, 1, kF32);
         L.ctx_norm = up(name(ds_mainline_ ? "ctx_norm.weight" : "dflare_norm.weight"), kWidth, 1, kF32);
-        L.q = up(name("attn_q.weight"), kWidth, kQuery, kAnyMat);
-        L.k = up(name("attn_k.weight"), kWidth, kKey, kAnyMat);
-        L.v = up(name("attn_v.weight"), kWidth, kKey, kAnyMat);
-        L.o = up(name("attn_output.weight"), kQuery, kWidth, kAnyMat);
-        L.k_ctx = up(name("attn_k_ctx.weight"), kWidth, kKey, kAnyMat);
-        L.v_ctx = up(name("attn_v_ctx.weight"), kWidth, kKey, kAnyMat);
+        L.q = up(name("attn_q.weight"), kWidth, kQuery, ds_mat);
+        L.k = up(name("attn_k.weight"), kWidth, kKey, ds_mat);
+        L.v = up(name("attn_v.weight"), kWidth, kKey, ds_mat);
+        L.o = up(name("attn_output.weight"), kQuery, kWidth, ds_mat);
+        L.k_ctx = up(name("attn_k_ctx.weight"), kWidth, kKey, ds_mat);
+        L.v_ctx = up(name("attn_v_ctx.weight"), kWidth, kKey, ds_mat);
         L.q_norm = up(name("attn_q_norm.weight"), kHead, 1, kF32);
         L.k_norm = up(name("attn_k_norm.weight"), kHead, 1, kF32);
         L.k_ctx_norm = up(name("attn_k_ctx_norm.weight"), kHead, 1, kF32);
-        L.gate = up(name("ffn_gate.weight"), kWidth, kDsFfn, kAnyMat);
-        L.up = up(name("ffn_up.weight"), kWidth, kDsFfn, kAnyMat);
-        L.down = up(name("ffn_down.weight"), kDsFfn, kWidth, kAnyMat);
+        L.gate = up(name("ffn_gate.weight"), kWidth, kDsFfn, ds_mat);
+        L.up = up(name("ffn_up.weight"), kWidth, kDsFfn, ds_mat);
+        L.down = up(name("ffn_down.weight"), kDsFfn, kWidth, ds_mat);
     }
     ds_out_norm_ = up("output_norm.weight", kWidth, 1, kF32);
     const TensorInfo* mask_t = g.find("mask_embd.weight");
@@ -1113,7 +1118,13 @@ void Inkling2::assign_scratch() {
     gain_ = fbuf(width);
     forget_ = fbuf(width);
     if (!draft_) return;
-    ds_taps_ = fbuf(3 * width);
+    if (ds_compact_) {
+        ds_taps_f16_ = (uint16_t*) fbuf((3 * width + 1) / 2);
+        ds_taps_ = nullptr;
+    } else {
+        ds_taps_ = fbuf(3 * width);
+        ds_taps_f16_ = nullptr;
+    }
     const size_t b = kDsBlock;
     ds_x_ = fbuf(b * kWidth);
     ds_xa_ = fbuf(b * kWidth);
@@ -1136,9 +1147,18 @@ void Inkling2::assign_scratch() {
     ds_lat_ = fbuf(kDsRank);
     ds_att_ = fbuf(dspark::attend_floats());
     ds_b2_ = fbuf((size_t) ds_w2_ld_);
-    ds_w2_ = (uint16_t*) fbuf(((size_t) kDsRank * (size_t) ds_w2_ld_ + 1) / 2);
+    if (ds_compact_) {
+        ds_w2_i8_ = (int8_t*) fbuf(((size_t) kDsRank * (size_t) ds_w2_ld_ + 3) / 4);
+        ds_w2_scale_ = fbuf(kDsRank);
+        ds_w2_ = nullptr;
+    } else {
+        ds_w2_ = (uint16_t*) fbuf(((size_t) kDsRank * (size_t) ds_w2_ld_ + 1) / 2);
+        ds_w2_i8_ = nullptr;
+        ds_w2_scale_ = nullptr;
+    }
     if (!ds_host_) ds_host_ = (float*) hmalloc(b * kWidth * sizeof(float), "pinned memory");
     ds_head_ready_ = false;
+    if (scratch_ && ds_mainline_) prepare_head();
 }
 
 void Inkling2::conv(float* x, float* state, const float* w, const float* dynamic, int width, int n) {
@@ -1332,10 +1352,15 @@ void Inkling2::run_visits(int n) {
         }
         if (draft_)   // the drafter's taps: the residual entering visits 5, 23 and 41 (drafter_kept())
             for (int j = 0; j < 3; ++j)
-                if (visit_ == kTap[j])
-                    ck(cudaMemcpyAsync(ds_taps_ + (size_t) j * rows_ * kWidth, r_, (size_t) n * kWidth * sizeof(float),
-                                       cudaMemcpyDeviceToDevice, cs(st_)),
-                       "DSpark taps");
+                if (visit_ == kTap[j]) {
+                    if (ds_compact_) {
+                        dspark::store_tap_f16(r_, ds_taps_f16_ + (size_t) j * rows_ * kWidth, (size_t) n * kWidth, cs(st_));
+                    } else {
+                        ck(cudaMemcpyAsync(ds_taps_ + (size_t) j * rows_ * kWidth, r_, (size_t) n * kWidth * sizeof(float),
+                                           cudaMemcpyDeviceToDevice, cs(st_)),
+                           "DSpark taps");
+                    }
+                }
         layer(physical(visit_), n);
     }
 }
@@ -1563,11 +1588,20 @@ void Inkling2::drafter_kept(int n) {
     if (n <= 0) return;
     const size_t plane = (size_t) rows_ * kWidth;
     dspark::Taps t{{ds_taps_, ds_taps_ + plane, ds_taps_ + 2 * plane, hn_ + n_embd_}, {}};
+    dspark::TapsF16 tf16{{ds_taps_f16_, ds_taps_f16_ + plane, ds_taps_f16_ + 2 * plane}, hn_ + n_embd_, {}};
+    auto run_mix = [&](const float* norm, float* dst, int first, int count, const float* w4) {
+        if (ds_compact_) {
+            std::copy(w4, w4 + 4, tf16.w);
+            dspark::mix_taps_f16(tf16, norm, dst, first, count, ds_eps_, cs(st_));
+        } else {
+            std::copy(w4, w4 + 4, t.w);
+            dspark::mix_taps(t, norm, dst, first, count, ds_eps_, cs(st_));
+        }
+    };
     float* x = input_[0];
     for (int l = 0; l < kDsLayers; ++l) {
         const DsLayer& L = ds_[(size_t) l];
-        std::copy(ds_mix_[l], ds_mix_[l] + 4, t.w);
-        dspark::mix_taps(t, fp(L.ctx_norm), x, 0, n, ds_eps_, cs(st_));
+        run_mix(fp(L.ctx_norm), x, 0, n, ds_mix_[l]);
         lin(L.k_ctx, x, k_, n);
         lin(L.v_ctx, x, v_, n);
         head_norm_rope(k_, kHead, fp(L.k_ctx_norm), q_, kHead, kKv, kHead, ds_theta_, pos_, n, ds_eps_, st_);
@@ -1584,8 +1618,7 @@ void Inkling2::drafter_kept(int n) {
             at = ring ? 0 : at + m;
         }
     }
-    std::copy(ds_mix_[kDsLayers], ds_mix_[kDsLayers] + 4, t.w);
-    dspark::mix_taps(t, fp(ds_rnn_norm_), hn_, n - 1, 1, ds_eps_, cs(st_));
+    run_mix(fp(ds_rnn_norm_), hn_, n - 1, 1, ds_mix_[kDsLayers]);
 }
 
 // W' = W_head W_hidden_out and b' = W_head b_hidden_out, so that a step scores the vocabulary from its 256 latents
@@ -1593,25 +1626,66 @@ void Inkling2::drafter_kept(int n) {
 // columns of hidden_out at a time, through wlogits_.
 void Inkling2::prepare_head() {
     if (ds_mainline_) {
-        // Transpose markov_w2 [ds_vocab_][kDsRank] -> [kDsRank][ds_w2_ld_] in 32x32 cache tiles so
-        // head_kernel_vec2 performs 100% coalesced 32-bit loads across vocab lanes.
         const uint16_t* src = (const uint16_t*) ds_w2_host_;
-        std::vector<uint16_t> w2_t((size_t) kDsRank * (size_t) ds_w2_ld_, 0);
-        constexpr int kTile = 32;
-        for (int v0 = 0; v0 < ds_vocab_; v0 += kTile) {
-            const int v1 = std::min(v0 + kTile, ds_vocab_);
-            for (int r0 = 0; r0 < kDsRank; r0 += kTile) {
-                const int r1 = std::min(r0 + kTile, kDsRank);
-                for (int v = v0; v < v1; ++v) {
-                    const uint16_t* sv = src + (size_t) v * (size_t) kDsRank;
-                    for (int r = r0; r < r1; ++r) {
-                        w2_t[(size_t) r * (size_t) ds_w2_ld_ + (size_t) v] = sv[r];
+        const auto to_f32 = [&](uint16_t raw) -> float {
+            if (ds_w2_bf16_) {
+                const uint32_t u = (uint32_t) raw << 16;
+                float f;
+                std::memcpy(&f, &u, sizeof(float));
+                return f;
+            }
+            return ggml_fp16_to_fp32(raw);
+        };
+        if (ds_compact_) {
+            // Per-latent-row symmetric INT8 quantization + transpose [ds_vocab_][kDsRank] -> [kDsRank][ds_w2_ld_].
+            std::vector<float> amax(kDsRank, 0.f);
+            for (int v = 0; v < ds_vocab_; ++v) {
+                const uint16_t* sv = src + (size_t) v * (size_t) kDsRank;
+                for (int r = 0; r < kDsRank; ++r) amax[r] = std::max(amax[r], std::fabs(to_f32(sv[r])));
+            }
+            std::vector<float> scale(kDsRank, 0.f), inv(kDsRank, 0.f);
+            for (int r = 0; r < kDsRank; ++r) {
+                scale[r] = amax[r] / 127.f;
+                inv[r] = scale[r] > 0.f ? (127.f / amax[r]) : 0.f;
+            }
+            std::vector<int8_t> w2_q((size_t) kDsRank * (size_t) ds_w2_ld_, 0);
+            constexpr int kTile = 32;
+            for (int v0 = 0; v0 < ds_vocab_; v0 += kTile) {
+                const int v1 = std::min(v0 + kTile, ds_vocab_);
+                for (int r0 = 0; r0 < kDsRank; r0 += kTile) {
+                    const int r1 = std::min(r0 + kTile, kDsRank);
+                    for (int v = v0; v < v1; ++v) {
+                        const uint16_t* sv = src + (size_t) v * (size_t) kDsRank;
+                        for (int r = r0; r < r1; ++r) {
+                            const int qv = (int) std::lrintf(to_f32(sv[r]) * inv[r]);
+                            w2_q[(size_t) r * (size_t) ds_w2_ld_ + (size_t) v] = (int8_t) std::clamp(qv, -127, 127);
+                        }
                     }
                 }
             }
+            ck(cudaMemcpyAsync(ds_w2_i8_, w2_q.data(), w2_q.size(), cudaMemcpyHostToDevice, cs(st_)),
+               "DSpark markov_w2_i8");
+            ck(cudaMemcpyAsync(ds_w2_scale_, scale.data(), kDsRank * sizeof(float), cudaMemcpyHostToDevice, cs(st_)),
+               "DSpark markov_w2_scale");
+        } else {
+            // Transpose markov_w2 [ds_vocab_][kDsRank] -> [kDsRank][ds_w2_ld_] in 32x32 cache tiles.
+            std::vector<uint16_t> w2_t((size_t) kDsRank * (size_t) ds_w2_ld_, 0);
+            constexpr int kTile = 32;
+            for (int v0 = 0; v0 < ds_vocab_; v0 += kTile) {
+                const int v1 = std::min(v0 + kTile, ds_vocab_);
+                for (int r0 = 0; r0 < kDsRank; r0 += kTile) {
+                    const int r1 = std::min(r0 + kTile, kDsRank);
+                    for (int v = v0; v < v1; ++v) {
+                        const uint16_t* sv = src + (size_t) v * (size_t) kDsRank;
+                        for (int r = r0; r < r1; ++r) {
+                            w2_t[(size_t) r * (size_t) ds_w2_ld_ + (size_t) v] = sv[r];
+                        }
+                    }
+                }
+            }
+            ck(cudaMemcpyAsync(ds_w2_, w2_t.data(), w2_t.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, cs(st_)),
+               "DSpark markov_w2");
         }
-        ck(cudaMemcpyAsync(ds_w2_, w2_t.data(), w2_t.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, cs(st_)),
-           "DSpark markov_w2");
         ck(cudaMemcpyAsync(ds_b2_, ds_b2_host_, (size_t) ds_vocab_ * sizeof(float), cudaMemcpyHostToDevice, cs(st_)),
            "DSpark markov_w2.bias");
         ck(cudaStreamSynchronize(cs(st_)), "DSpark head");
@@ -1718,8 +1792,13 @@ void Inkling2::draft_step(int32_t token, int i) {
     lin(ds_joint_, ds_jx_, ds_jo_, 1);
     dspark::recur(ds_jo_, fp(ds_joint_b_), ds_state_, ds_lat_, cs(st_));
     ds_base(i + 1);
-    dspark::head(ds_base_ + (size_t) i * n_vocab_, ds_b2_, ds_w2_, ds_lat_, logits_,
-                 ds_vocab_, n_vocab_, ds_w2_ld_, ds_w2_bf16_, ds_cap_, cs(st_));
+    if (ds_compact_) {
+        dspark::head_i8(ds_base_ + (size_t) i * n_vocab_, ds_b2_, ds_w2_i8_, ds_w2_scale_, ds_lat_, logits_,
+                        ds_vocab_, n_vocab_, ds_w2_ld_, ds_cap_, cs(st_));
+    } else {
+        dspark::head(ds_base_ + (size_t) i * n_vocab_, ds_b2_, ds_w2_, ds_lat_, logits_,
+                     ds_vocab_, n_vocab_, ds_w2_ld_, ds_w2_bf16_, ds_cap_, cs(st_));
+    }
 }
 
 void Inkling2::output_rows(int first, int rows, float* h) {

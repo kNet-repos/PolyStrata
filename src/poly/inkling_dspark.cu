@@ -37,6 +37,28 @@ __global__ void mix_taps_kernel(Taps t, const float* norm, float* out, int first
     for (int i = threadIdx.x; i < kWidth; i += 256) y[i] = y[i] * s * norm[i];
 }
 
+__global__ void store_tap_f16_kernel(const float* src, uint16_t* dst, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half_as_ushort(__float2half(src[i]));
+}
+
+__global__ void mix_taps_f16_kernel(TapsF16 t, const float* norm, float* out, int first, float eps) {
+    __shared__ float waves[8];
+    const size_t at = (size_t) (first + blockIdx.x) * kWidth;
+    float* y = out + (size_t) blockIdx.x * kWidth;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < kWidth; i += 256) {
+        float x = t.w[0] * __half2float(__ushort_as_half(t.tap[0][at + i]));
+        x = __fmaf_rn(t.w[1], __half2float(__ushort_as_half(t.tap[1][at + i])), x);
+        x = __fmaf_rn(t.w[2], __half2float(__ushort_as_half(t.tap[2][at + i])), x);
+        x = __fmaf_rn(t.w[3], t.last[at + i], x);
+        y[i] = x;
+        ss = __fmaf_rn(x, x, ss);
+    }
+    const float s = rsqrtf(block_sum<256>(ss, waves) / kWidth + eps);
+    for (int i = threadIdx.x; i < kWidth; i += 256) y[i] = y[i] * s * norm[i];
+}
+
 // The attention: a block takes one K/V group's 24 queries (8 rows x 3 heads) over tiles of 32 keys, tile b, b + parts,
 // ..., with an online softmax; a second launch adds the parts.  A thread is a value of the head (128 of them).
 constexpr int kQ = kBlock * (kHeads / kKv), kTile = 32, kParts = 64;
@@ -213,6 +235,51 @@ head_kernel_vec2(const float* __restrict__ base, const float* __restrict__ bias2
     }
 }
 
+// Custom RDNA2 wave32 coalesced 4-vocab-per-thread INT8 DSpark head projection:
+// Folds per-latent-row scale into LDS lat[i], loads 4 int8 weights per 32-bit dword (51 MB vs 102 MB).
+__global__ void __launch_bounds__(kRank)
+head_kernel_i8_vec4(const float* __restrict__ base, const float* __restrict__ bias2,
+                    const uint32_t* __restrict__ w2_quad, const float* __restrict__ w2_scale,
+                    const float* __restrict__ latent, float* __restrict__ logits,
+                    int n_active, int n_total, int ld_quads, float cap) {
+    __shared__ float lat[kRank];
+    lat[threadIdx.x] = latent[threadIdx.x] * w2_scale[threadIdx.x];
+    __syncthreads();
+    const int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int v0 = q_idx * 4;
+    if (v0 >= n_total) return;
+    if (v0 >= n_active) {
+        for (int k = 0; k < 4 && v0 + k < n_total; ++k) logits[v0 + k] = -INFINITY;
+        return;
+    }
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    const uint32_t* wp = w2_quad + q_idx;
+#pragma unroll 8
+    for (int i = 0; i < kRank; ++i) {
+        const uint32_t p = wp[(size_t) i * (size_t) ld_quads];
+        const float l = lat[i];
+        const int8_t c0 = (int8_t) (p & 0xFFu);
+        const int8_t c1 = (int8_t) ((p >> 8) & 0xFFu);
+        const int8_t c2 = (int8_t) ((p >> 16) & 0xFFu);
+        const int8_t c3 = (int8_t) (p >> 24);
+        a0 = __fmaf_rn(l, (float) c0, a0);
+        a1 = __fmaf_rn(l, (float) c1, a1);
+        a2 = __fmaf_rn(l, (float) c2, a2);
+        a3 = __fmaf_rn(l, (float) c3, a3);
+    }
+    const float inv_cap = 1.f / cap;
+    const float acc[4] = {a0, a1, a2, a3};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int v = v0 + k;
+        if (v < n_active) {
+            logits[v] = cap * tanhf((base[v] + bias2[v] + acc[k]) * inv_cap);
+        } else if (v < n_total) {
+            logits[v] = -INFINITY;
+        }
+    }
+}
+
 __global__ void fill_rows_kernel(const float* src, float* dst, int width, int rows) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < width * rows) dst[i] = src[i % width];
@@ -229,6 +296,14 @@ __global__ void to_half_kernel(const float* src, uint16_t* dst, int n, int rows,
 
 void mix_taps(const Taps& t, const float* norm, float* out, int first, int n, float eps, cudaStream_t st) {
     if (n > 0) mix_taps_kernel<<<n, 256, 0, st>>>(t, norm, out, first, eps);
+}
+
+void store_tap_f16(const float* src, uint16_t* dst, size_t n_floats, cudaStream_t st) {
+    if (n_floats > 0) store_tap_f16_kernel<<<(int) ((n_floats + 255) / 256), 256, 0, st>>>(src, dst, n_floats);
+}
+
+void mix_taps_f16(const TapsF16& t, const float* norm, float* out, int first, int n, float eps, cudaStream_t st) {
+    if (n > 0) mix_taps_f16_kernel<<<n, 256, 0, st>>>(t, norm, out, first, eps);
 }
 
 size_t attend_floats() { return (size_t) kKv * kParts * kQ * (kHead + 2); }
@@ -262,6 +337,14 @@ void head(const float* base, const float* bias2, const uint16_t* w2, const float
         head_kernel_vec2<false><<<grid, kRank, 0, st>>>(base, bias2, (const uint32_t*) w2, latent, logits,
                                                         n_active, n_total, ld_pairs, cap);
     }
+}
+
+void head_i8(const float* base, const float* bias2, const int8_t* w2_i8, const float* w2_scale, const float* latent,
+             float* logits, int n_active, int n_total, int ld, float cap, cudaStream_t st) {
+    const int n_quads = (n_total + 3) / 4;
+    const int ld_quads = ld / 4;
+    head_kernel_i8_vec4<<<div_up(n_quads, kRank), kRank, 0, st>>>(
+        base, bias2, (const uint32_t*) w2_i8, w2_scale, latent, logits, n_active, n_total, ld_quads, cap);
 }
 
 void fill_rows(const float* src, float* dst, int width, int rows, cudaStream_t st) {

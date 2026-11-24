@@ -76,16 +76,26 @@ public:
     bool wants(int n) {
         const int to = n + 2;   // the window's tokens with this guess
         more_ = knows(to) ? std::clamp((ms_[to] - round_ms(to - 1)) / one_, 0.2, 0.8) : kUnmeasured;
-        // asking takes time too: not when a guess the block were sure of would not pay for it
-        const double ask = measured_ && fresh(asked_at_) ? ask_ms_ : 0.0;
+        // Separate first-guess (block setup) vs follow-up guess latency (critical for DSpark where n=0 runs the
+        // 3-layer block + base projection while n>=1 only runs the ~0.3 ms recurrent head!).
+        const double ask = n == 0 ? (measured_ && fresh(asked0_at_) ? ask0_ms_ : 0.0)
+                                  : (measured_ && fresh(asked_at_) ? ask_ms_ : 0.0);
         return sure_ * round_ms(to - 1) > tokens_ * (more_ * one_ + ask);
     }
 
     /// The block's guess after n others, right with probability p; asking took `ms`.  Returns whether it joins
     /// the window.
     bool takes(int n, double p, double ms) {
-        ask_ms_ = fresh(asked_at_) ? ask_ms_ + 0.1 * (std::min(ms, 2.0 * ask_ms_) - ask_ms_) : ms;
-        asked_at_ = round_;
+        if (n == 0) {
+            // Skip cold-start first-round JIT/warmup spikes so they cannot poison ask0_ms_ for kFresh rounds.
+            if (measured_ || ms <= 50.0) {
+                ask0_ms_ = fresh(asked0_at_) ? ask0_ms_ + 0.1 * (std::min(ms, 2.0 * ask0_ms_) - ask0_ms_) : ms;
+                asked0_at_ = round_;
+            }
+        } else {
+            ask_ms_ = fresh(asked_at_) ? ask_ms_ + 0.1 * (std::min(ms, 2.0 * ask_ms_) - ask_ms_) : ms;
+            asked_at_ = round_;
+        }
         ++asked_;
         sure_ *= p;
         if (sure_ * round_ms(n + 1) <= tokens_ * more_ * one_) return false;
@@ -115,7 +125,9 @@ private:
     long long round_ = 0;                            // the first is 1
     double ms_[spec::DraftPolicy::kMaxT + 1] = {};   // a round's time by its window's tokens
     long long at_[spec::DraftPolicy::kMaxT + 1] = {};   // the round that time is of; 0: none yet
-    double ask_ms_ = 0.0;                            // what one guess of the block takes
+    double ask0_ms_ = 0.0;                           // first guess (block setup + first head step)
+    long long asked0_at_ = 0;
+    double ask_ms_ = 0.0;                            // follow-up guess (n >= 1)
     long long asked_at_ = 0;
     bool measured_ = false;                          // some round's time is known: asking can be weighed against it
     // of the round
